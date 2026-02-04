@@ -1,0 +1,452 @@
+from pathlib import Path
+import re
+import json
+import cv2
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# =========================
+# CONFIG
+# =========================
+BASE_DIR = Path("/Users/anastasia/SpeedyAgro/data/segmentation field")
+OUT_DIR = Path("/Users/anastasia/SpeedyAgro/outputs")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+IMG_EXT = {".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"}
+
+# Soglie (tarabili su 5-10 immagini)
+WATER_SAT_THRESH = 60   # saturazione bassa -> probabile acqua/allagamento
+BROWN_H_MIN = 10        # Hue OpenCV [0..179]
+BROWN_H_MAX = 35
+BROWN_S_MIN = 60
+BROWN_V_MIN = 35
+
+BROWN_PCT_TRIGGER = 2.0     # % brown sopra cui dici "scendi"
+BROWN_MIN_AREA_PX = 1200    # area minima per hotspot
+
+# =========================
+# UTILS
+# =========================
+def parse_height(path: Path):
+    """
+    Estrae altezza da nomi tipo: DJI_0014-h80.JPG oppure DJI_0014_h80.JPG
+    """
+    m = re.search(r"[-_ ]h(\d+)", path.stem, flags=re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
+def list_images(base_dir: Path):
+    return sorted([p for p in base_dir.rglob("*") if p.suffix in IMG_EXT])
+
+
+def compute_masks(img_bgr):
+    """
+    Ritorna:
+      veg_mask, water_mask, soil_mask, brown_mask
+    Tutti boolean (H x W)
+    """
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    H, S, V = cv2.split(hsv)
+
+    # --- Vegetazione (ExG)
+    b, g, r = cv2.split(img_bgr.astype(np.float32))
+    exg = 2 * g - r - b
+    exg_norm = cv2.normalize(exg, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    _, veg = cv2.threshold(exg_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    veg = cv2.morphologyEx(veg, cv2.MORPH_OPEN, k, iterations=1)
+    veg = cv2.morphologyEx(veg, cv2.MORPH_CLOSE, k, iterations=2)
+    veg_mask = veg > 0
+
+    # --- Water (non-veg + bassa saturazione)
+    water_mask = (~veg_mask) & (S < WATER_SAT_THRESH)
+
+    # --- Soil (resto)
+    soil_mask = (~veg_mask) & (~water_mask)
+
+    # --- Brown/stress: dentro veg, hue giallo/marrone + S alta
+    brown_mask = (
+        veg_mask
+        & (H >= BROWN_H_MIN) & (H <= BROWN_H_MAX)
+        & (S >= BROWN_S_MIN)
+        & (V >= BROWN_V_MIN)
+    )
+
+    return veg_mask, water_mask, soil_mask, brown_mask
+
+
+def pct(mask_bool):
+    return float(mask_bool.mean() * 100.0)
+
+
+def connected_hotspots(mask_bool, min_area_px=BROWN_MIN_AREA_PX):
+    """
+    Trova regioni connesse e ritorna lista di hotspot:
+      [{"cx":..., "cy":..., "area":..., "bbox":[x,y,w,h]}]
+    """
+    m = (mask_bool.astype(np.uint8) * 255)
+    num, labels, stats, centroids = cv2.connectedComponentsWithStats(m, connectivity=8)
+
+    hotspots = []
+    for i in range(1, num):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area >= min_area_px:
+            x = int(stats[i, cv2.CC_STAT_LEFT])
+            y = int(stats[i, cv2.CC_STAT_TOP])
+            w = int(stats[i, cv2.CC_STAT_WIDTH])
+            h = int(stats[i, cv2.CC_STAT_HEIGHT])
+            cx, cy = centroids[i]
+            hotspots.append({"cx": float(cx), "cy": float(cy), "area": area, "bbox": [x, y, w, h]})
+
+    hotspots.sort(key=lambda d: d["area"], reverse=True)
+    return hotspots
+
+
+def vegetation_target(veg_mask):
+    """
+    Trova il target principale: centroide della componente di vegetazione più grande.
+    Ritorna (cx, cy) oppure None.
+    """
+    m = (veg_mask.astype(np.uint8) * 255)
+    num, labels, stats, centroids = cv2.connectedComponentsWithStats(m, connectivity=8)
+    if num <= 1:
+        return None
+
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    idx = int(np.argmax(areas)) + 1
+    cx, cy = centroids[idx]
+    return float(cx), float(cy)
+
+
+def make_overlay(img_bgr, veg_mask, water_mask, brown_mask=None, target=None):
+    """
+    Crea overlay visivo:
+      - evidenzia vegetazione (verde)
+      - acqua (blu)
+      - brown (rosso)
+      - target (cerchio)
+    """
+    overlay = (img_bgr.copy() * 0.65).astype(np.uint8)
+
+    if veg_mask is not None:
+        overlay[veg_mask] = (0, 180, 0)       # verde
+    if water_mask is not None:
+        overlay[water_mask] = (200, 0, 0)     # blu (BGR)
+    if brown_mask is not None:
+        overlay[brown_mask] = (0, 0, 255)     # rosso
+
+    out = cv2.addWeighted(img_bgr, 0.55, overlay, 0.45, 0)
+
+    if target is not None:
+        cx, cy = target
+        cv2.circle(out, (int(cx), int(cy)), 14, (0, 255, 255), 3)
+        cv2.putText(
+            out, "TARGET", (int(cx) + 18, int(cy) - 18),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA
+        )
+
+    return out
+
+
+def draw_hotspots(img_bgr, hotspots, label="BROWN"):
+    """
+    Disegna bbox + cerchio per i primi hotspot (max 3)
+    """
+    out = img_bgr.copy()
+    for i, h in enumerate(hotspots[:3]):
+        x, y, w, hh = h["bbox"]
+        cx, cy = h["cx"], h["cy"]
+        cv2.rectangle(out, (x, y), (x + w, y + hh), (0, 0, 255), 3)
+        cv2.circle(out, (int(cx), int(cy)), 14, (0, 0, 255), 3)
+        cv2.putText(
+            out, f"{label}#{i+1} area={h['area']}",
+            (x, max(30, y - 10)), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+            (0, 0, 255), 2, cv2.LINE_AA
+        )
+    return out
+
+
+def plot_examples(examples, title, out_png):
+    """
+    Plotta 3 esempi (o meno) con:
+      - Original
+      - Overlay classificazione
+      - Highlight anomalia (se presente) oppure overlay
+    """
+    n = len(examples)
+    if n == 0:
+        print(f"[WARN] Nessun esempio da plottare per {title}")
+        return
+
+    cols = 3
+    plt.figure(figsize=(16, 5 * n))
+
+    for i, ex in enumerate(examples):
+        plt.subplot(n, cols, i * cols + 1)
+        plt.imshow(ex["img_rgb"])
+        plt.title(f"{ex['file']} - Original")
+        plt.axis("off")
+
+        plt.subplot(n, cols, i * cols + 2)
+        plt.imshow(ex["overlay_rgb"])
+        plt.title("Classification overlay (veg/water/soil)")
+        plt.axis("off")
+
+        plt.subplot(n, cols, i * cols + 3)
+        if ex.get("anom_rgb", None) is not None:
+            plt.imshow(ex["anom_rgb"])
+            plt.title("Anomaly highlight (brown hotspots)")
+        else:
+            plt.imshow(ex["overlay_rgb"])
+            plt.title("Overlay (no anomaly)")
+        plt.axis("off")
+
+    plt.suptitle(title, y=0.98)
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150)
+    plt.close()
+
+
+def save_plot_summary(df, title, out_png):
+    """
+    Plot delle percentuali per immagine (veg/water/soil + brown se presente)
+    """
+    if len(df) == 0:
+        print(f"[WARN] Nessuna immagine per {title}")
+        return
+
+    plt.figure(figsize=(14, 6))
+    plt.plot(df["veg_pct"].values, label="veg_pct")
+    plt.plot(df["water_pct"].values, label="water_pct")
+    plt.plot(df["soil_pct"].values, label="soil_pct")
+    if "brown_pct" in df.columns:
+        plt.plot(df["brown_pct"].values, label="brown_pct")
+
+    plt.title(title)
+    plt.xlabel("image index")
+    plt.ylabel("percentage (%)")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=150)
+    plt.close()
+
+
+def crop_roi(img_bgr, bbox, pad=20):
+    x, y, w, h = bbox
+    H, W = img_bgr.shape[:2]
+    x0 = max(0, x - pad); y0 = max(0, y - pad)
+    x1 = min(W, x + w + pad); y1 = min(H, y + h + pad)
+    return img_bgr[y0:y1, x0:x1].copy()
+
+
+# =========================
+# PIPELINES
+# =========================
+def analyze_range(paths, h_min, h_max, do_brown=False, out_subdir="step"):
+    out_dir = OUT_DIR / out_subdir
+    (out_dir / "overlays").mkdir(parents=True, exist_ok=True)
+    (out_dir / "json").mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    examples = []           # 3 esempi (qualunque)
+    anomaly_examples = []   # 3 esempi con brown (solo per step B)
+
+    for p in paths:
+        h = parse_height(p)
+        if h is None or not (h_min <= h <= h_max):
+            continue
+
+        img = cv2.imread(str(p))
+        if img is None:
+            continue
+
+        veg, water, soil, brown = compute_masks(img)
+        target = vegetation_target(veg)
+
+        row = {
+            "file": p.name,
+            "path": str(p),
+            "height": h,
+            "veg_pct": pct(veg),
+            "water_pct": pct(water),
+            "soil_pct": pct(soil),
+        }
+
+        hotspots = []
+        brown_pct = 0.0
+        if do_brown:
+            brown_pct = pct(brown)
+            hotspots = connected_hotspots(brown)
+            row["brown_pct"] = brown_pct
+            row["brown_hotspots_count"] = len(hotspots)
+
+        # overlay + save
+        overlay = make_overlay(img, veg, water, brown if do_brown else None, target=target)
+        out_overlay = out_dir / "overlays" / f"{p.stem}_overlay.png"
+        cv2.imwrite(str(out_overlay), overlay)
+
+        # json "decision" per drone
+        decision = {
+            "file": p.name,
+            "height": h,
+            "veg_pct": row["veg_pct"],
+            "water_pct": row["water_pct"],
+            "soil_pct": row["soil_pct"],
+            "target_px": target,
+            "target_rel": None,
+            "brown_pct": brown_pct if do_brown else None,
+            "brown_hotspots": hotspots if do_brown else None,
+            "action": None
+        }
+
+        Himg, Wimg = img.shape[:2]
+        if target is not None:
+            cx, cy = target
+            decision["target_rel"] = [cx / Wimg, cy / Himg]
+
+        if do_brown and brown_pct >= BROWN_PCT_TRIGGER and len(hotspots) > 0:
+            decision["action"] = {
+                "type": "descend_to_30",
+                "reason": f"brown_pct={brown_pct:.2f}%",
+                "hotspot_px": [hotspots[0]["cx"], hotspots[0]["cy"]],
+                "hotspot_rel": [hotspots[0]["cx"] / Wimg, hotspots[0]["cy"] / Himg]
+            }
+        else:
+            decision["action"] = {"type": "track_vegetation", "reason": "maximize vegetation coverage"}
+
+        out_json = out_dir / "json" / f"{p.stem}.json"
+        out_json.write_text(json.dumps(decision, indent=2))
+
+        # ======= RACCOLTA 3 ESEMPI PER PLOT =======
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+
+        if len(examples) < 3:
+            examples.append({
+                "file": p.name,
+                "img_rgb": img_rgb,
+                "overlay_rgb": overlay_rgb,
+                "anom_rgb": None
+            })
+
+        if do_brown and brown_pct >= BROWN_PCT_TRIGGER and len(hotspots) > 0:
+            anom_vis = draw_hotspots(overlay, hotspots, label="BROWN")
+            anom_rgb = cv2.cvtColor(anom_vis, cv2.COLOR_BGR2RGB)
+            if len(anomaly_examples) < 3:
+                anomaly_examples.append({
+                    "file": p.name,
+                    "img_rgb": img_rgb,
+                    "overlay_rgb": overlay_rgb,
+                    "anom_rgb": anom_rgb
+                })
+
+        rows.append(row)
+
+    df = pd.DataFrame(rows).sort_values(["height", "file"]).reset_index(drop=True)
+    df.to_csv(out_dir / f"summary_h{h_min}_to_h{h_max}.csv", index=False)
+
+    # plot summary percentuali
+    save_plot_summary(df, f"{out_subdir}: h {h_min}..{h_max}", out_dir / "summary_plot.png")
+
+    # plot 3 esempi (per vedere che ha classificato)
+    plot_examples(examples, f"{out_subdir}: examples (3)", out_dir / "examples_3.png")
+
+    # plot 3 esempi con anomalia (solo step B)
+    if do_brown:
+        plot_examples(anomaly_examples, f"{out_subdir}: anomaly examples (3)", out_dir / "anomaly_examples_3.png")
+
+    return df
+
+
+def analyze_h30_only(paths, out_subdir="step_C_h30"):
+    out_dir = OUT_DIR / out_subdir
+    (out_dir / "overlays").mkdir(parents=True, exist_ok=True)
+    (out_dir / "crops").mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    examples = []
+    anomaly_examples = []
+
+    for p in paths:
+        h = parse_height(p)
+        if h != 30:
+            continue
+
+        img = cv2.imread(str(p))
+        if img is None:
+            continue
+
+        veg, water, soil, brown = compute_masks(img)
+        target = vegetation_target(veg)
+        hotspots = connected_hotspots(brown)
+        brown_pct = pct(brown)
+
+        overlay = make_overlay(img, veg, water, brown_mask=brown, target=target)
+        out_overlay = out_dir / "overlays" / f"{p.stem}_overlay.png"
+        cv2.imwrite(str(out_overlay), overlay)
+
+        # se brown hotspot presente, salva crop ROI da dare al collega
+        if len(hotspots) > 0:
+            roi = crop_roi(img, hotspots[0]["bbox"], pad=30)
+            out_crop = out_dir / "crops" / f"{p.stem}_brown_roi.png"
+            cv2.imwrite(str(out_crop), roi)
+
+        # esempi plot (3)
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+        if len(examples) < 3:
+            examples.append({"file": p.name, "img_rgb": img_rgb, "overlay_rgb": overlay_rgb, "anom_rgb": None})
+
+        if brown_pct >= BROWN_PCT_TRIGGER and len(hotspots) > 0 and len(anomaly_examples) < 3:
+            anom_vis = draw_hotspots(overlay, hotspots, label="BROWN")
+            anom_rgb = cv2.cvtColor(anom_vis, cv2.COLOR_BGR2RGB)
+            anomaly_examples.append({"file": p.name, "img_rgb": img_rgb, "overlay_rgb": overlay_rgb, "anom_rgb": anom_rgb})
+
+        rows.append({
+            "file": p.name,
+            "height": h,
+            "veg_pct": pct(veg),
+            "water_pct": pct(water),
+            "soil_pct": pct(soil),
+            "brown_pct": brown_pct,
+            "hotspots": len(hotspots)
+        })
+
+    df = pd.DataFrame(rows).sort_values(["file"]).reset_index(drop=True)
+    df.to_csv(out_dir / "summary_h30.csv", index=False)
+    save_plot_summary(df, f"{out_subdir}: h=30", out_dir / "summary_plot.png")
+
+    # plot 3 esempi (e 3 esempi con brown se presenti)
+    plot_examples(examples, f"{out_subdir}: examples (3)", out_dir / "examples_3.png")
+    plot_examples(anomaly_examples, f"{out_subdir}: anomaly examples (3)", out_dir / "anomaly_examples_3.png")
+
+    return df
+
+
+# =========================
+# MAIN
+# =========================
+def main():
+    paths = list_images(BASE_DIR)
+    print("Total files found:", len(paths))
+
+    # STEP A: 80..50 (overview acqua/pianta/suolo + target vegetazione)
+    df_A = analyze_range(paths, 50, 80, do_brown=False, out_subdir="step_A_h80_to_h50")
+    print("STEP A images:", len(df_A))
+
+    # STEP B: 60..35 (acqua/pianta + brown/stress) + evidenzia anomalia
+    df_B = analyze_range(paths, 35, 60, do_brown=True, out_subdir="step_B_h60_to_h35")
+    print("STEP B images:", len(df_B))
+
+    # STEP C: h=30 (plot + crop ROI per anomaly detection collega)
+    df_C = analyze_h30_only(paths, out_subdir="step_C_h30")
+    print("STEP C images:", len(df_C))
+
+    print("\nDONE.")
+    print("Outputs saved in:", OUT_DIR)
+
+
+if __name__ == "__main__":
+    main()

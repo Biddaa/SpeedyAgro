@@ -1,0 +1,455 @@
+from pathlib import Path
+import re
+import json
+import cv2
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+
+# =========================
+# CONFIG
+# =========================
+BASE_DIR = Path("/Users/anastasia/SpeedyAgro/data/segmentation field")
+OUT_DIR = Path("/Users/anastasia/SpeedyAgro/outputs")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+IMG_EXT = {".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"}
+
+# Morphology thresholds
+WATER_SAT_THRESH = 60  # low saturation -> likely water/flooding
+
+# Step 3: ResNet settings
+PATCH_SIZE = 128
+MODEL_PATH = None  # initialized when needed
+
+# =========================
+# UTILS
+# =========================
+def parse_height(path: Path):
+    """
+    Extracts height from filenames like: DJI_0014-h80.JPG or DJI_0014_h80.JPG
+    """
+    m = re.search(r"[-_ ]h(\d+)", path.stem, flags=re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
+def list_images(base_dir: Path):
+    return sorted([p for p in base_dir.rglob("*") if p.suffix in IMG_EXT])
+
+
+# =========================
+# STEP 1 & 2: MORPHOLOGY
+# =========================
+def compute_water_field_masks(img_bgr):
+    """
+    STEP 1 (80-50m): Detect WATER vs FIELD
+    Returns: water_mask, field_mask (boolean)
+    """
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    H, S, V = cv2.split(hsv)
+
+    # Water = low saturation
+    water_mask = (S < WATER_SAT_THRESH)
+
+    # Field = everything else
+    field_mask = ~water_mask
+
+    # Morphology cleanup
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    water_clean = cv2.morphologyEx(
+        water_mask.astype(np.uint8) * 255, cv2.MORPH_OPEN, k, iterations=1
+    )
+    field_clean = cv2.morphologyEx(
+        field_mask.astype(np.uint8) * 255, cv2.MORPH_CLOSE, k, iterations=2
+    )
+
+    return water_clean > 0, field_clean > 0
+
+
+def compute_water_veg_masks(img_bgr):
+    """
+    STEP 2 (60-35m): Detect WATER vs VEGETATION
+    Returns: water_mask, veg_mask (boolean)
+    """
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    H, S, V = cv2.split(hsv)
+
+    # Vegetation (ExG)
+    b, g, r = cv2.split(img_bgr.astype(np.float32))
+    exg = 2 * g - r - b
+    exg_norm = cv2.normalize(exg, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    _, veg = cv2.threshold(exg_norm, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    veg = cv2.morphologyEx(veg, cv2.MORPH_OPEN, k, iterations=1)
+    veg = cv2.morphologyEx(veg, cv2.MORPH_CLOSE, k, iterations=2)
+    veg_mask = veg > 0
+
+    # Water = non-vegetation + low saturation
+    water_mask = (~veg_mask) & (S < WATER_SAT_THRESH)
+
+    return water_mask, veg_mask
+
+
+def pct(mask_bool):
+    return float(mask_bool.mean() * 100.0)
+
+
+def make_overlay_step1(img_bgr, water_mask, field_mask):
+    """
+    Overlay for STEP 1: water (blue) vs field (brown/yellow)
+    """
+    overlay = (img_bgr.copy() * 0.4).astype(np.uint8)
+
+    overlay[field_mask] = (100, 200, 200)  # yellow/brown for field (BGR)
+    overlay[water_mask] = (200, 100, 0)    # blue-ish for water (BGR)
+
+    out = cv2.addWeighted(img_bgr, 0.5, overlay, 0.5, 0)
+    return out
+
+
+def make_overlay_step2(img_bgr, water_mask, veg_mask):
+    """
+    Overlay for STEP 2: water (blue) vs vegetation (green)
+    """
+    overlay = (img_bgr.copy() * 0.4).astype(np.uint8)
+
+    overlay[veg_mask] = (0, 200, 0)       # green for vegetation (BGR)
+    overlay[water_mask] = (200, 100, 0)   # blue-ish for water (BGR)
+
+    out = cv2.addWeighted(img_bgr, 0.5, overlay, 0.5, 0)
+    return out
+
+
+# =========================
+# STEP 3: ResNet50
+# =========================
+def load_resnet_model():
+    """
+    Loads a pre-trained ResNet50 or a custom model for tree/field classification.
+    Placeholder for now - replace with your fine-tuned model.
+    """
+    from tensorflow.keras.applications import ResNet50
+    from tensorflow.keras.models import Model
+    from tensorflow.keras.layers import Dense, GlobalAveragePooling2D
+
+    base_model = ResNet50(
+        weights="imagenet", include_top=False, input_shape=(PATCH_SIZE, PATCH_SIZE, 3)
+    )
+    x = base_model.output
+    x = GlobalAveragePooling2D()(x)
+    x = Dense(256, activation="relu")(x)
+    predictions = Dense(4, activation="softmax")(x)  # Vegetation, Water, Soil, Anomaly
+
+    model = Model(inputs=base_model.input, outputs=predictions)
+    return model
+
+
+def extract_patches(img, patch_size=PATCH_SIZE):
+    """
+    Extracts patches from the image.
+    """
+    patches = []
+    h, w = img.shape[:2]
+
+    for y in range(0, h - patch_size, patch_size):
+        for x in range(0, w - patch_size, patch_size):
+            patch = img[y : y + patch_size, x : x + patch_size]
+            patches.append(patch)
+
+    return np.array(patches)
+
+
+def classify_patch_simple(patch):
+    """
+    Simple morphology-based classification for tree vs field.
+    (Placeholder - replace with ResNet once you have a trained model.)
+    """
+    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+
+    # Water
+    if np.mean(s) < WATER_SAT_THRESH:
+        return "Water"
+
+    # Vegetation
+    b, g, r = cv2.split(patch.astype(np.float32))
+    exg = 2 * g - r - b
+    if np.mean(exg) > 10:
+        # Distinguish tree vs field based on texture/density
+        # Tree = denser, field = more uniform
+        texture = np.std(v)
+        if texture > 40:  # high variation = tree
+            return "Tree"
+        else:
+            return "Field"
+
+    # Soil
+    return "Soil"
+
+
+def make_patch_overlay(img, patch_size=PATCH_SIZE):
+    """
+    Creates an overlay like the example image with patch-level classification.
+    """
+    h, w = img.shape[:2]
+    overlay = np.zeros_like(img)
+
+    colors = {
+        "Field": [0, 255, 0],      # Green (BGR)
+        "Water": [255, 0, 0],      # Blue (BGR)
+        "Soil": [0, 255, 255],     # Yellow (BGR)
+        "Tree": [255, 165, 0],     # Orange (BGR)
+        "Anomaly": [0, 0, 255],    # Red (BGR)
+    }
+
+    for y in range(0, h - patch_size, patch_size):
+        for x in range(0, w - patch_size, patch_size):
+            patch = img[y : y + patch_size, x : x + patch_size]
+            label = classify_patch_simple(patch)
+
+            # Fill the square with the corresponding color
+            overlay[y : y + patch_size, x : x + patch_size] = colors[label]
+
+    return overlay
+
+
+# =========================
+# PIPELINES
+# =========================
+def analyze_step1(paths, out_subdir="step_1_h80_to_h50"):
+    """
+    STEP 1: 80-50m - Detect WATER vs VEGETATION
+    Output: 1 example image
+    """
+    out_dir = OUT_DIR / out_subdir
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    example_saved = False
+
+    for p in paths:
+        h = parse_height(p)
+        if h is None or not (50 <= h <= 80):
+            continue
+
+        img = cv2.imread(str(p))
+        if img is None:
+            continue
+
+        water, field = compute_water_field_masks(img)
+
+        row = {
+            "file": p.name,
+            "height": h,
+            "water_pct": pct(water),
+            "field_pct": pct(field),
+        }
+        rows.append(row)
+
+        # Save ONE example image
+        if not example_saved and h == 80:  # use the first at h=80
+            overlay = make_overlay_step1(img, water, field)
+
+            fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+            axes[0].imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            axes[0].set_title("Original (h=80m)", fontsize=14)
+            axes[0].axis("off")
+
+            axes[1].imshow(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
+            axes[1].set_title("STEP 1: Water vs vegetation Detection", fontsize=14)
+            axes[1].axis("off")
+
+            # Add legend
+            from matplotlib.patches import Patch
+
+            legend_elements = [
+                Patch(facecolor="blue", label="Water"),
+                Patch(facecolor="yellow", label="Vegetation"),
+            ]
+            axes[1].legend(handles=legend_elements, loc="upper right")
+
+            plt.tight_layout()
+            plt.savefig(out_dir / "step1_example.png", dpi=150, bbox_inches="tight")
+            plt.close()
+
+            example_saved = True
+
+    df = pd.DataFrame(rows).sort_values(["height", "file"]).reset_index(drop=True)
+    df.to_csv(out_dir / "summary.csv", index=False)
+
+    print(f"STEP 1 completed: {len(df)} images analyzed")
+    return df
+
+
+def analyze_step2(paths, out_subdir="step_2_h60_to_h35"):
+    """
+    STEP 2: 60-35m - Detect WATER vs VEGETATION
+    Output: 1 example image
+    """
+    out_dir = OUT_DIR / out_subdir
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    example_saved = False
+
+    for p in paths:
+        h = parse_height(p)
+        if h is None or not (35 <= h <= 60):
+            continue
+
+        img = cv2.imread(str(p))
+        if img is None:
+            continue
+
+        water, veg = compute_water_veg_masks(img)
+
+        row = {
+            "file": p.name,
+            "height": h,
+            "water_pct": pct(water),
+            "veg_pct": pct(veg),
+        }
+        rows.append(row)
+
+        # Save ONE example image
+        if not example_saved and h == 50:  # use the first at h=50
+            overlay = make_overlay_step2(img, water, veg)
+
+            fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+            axes[0].imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            axes[0].set_title("Original (h=50m)", fontsize=14)
+            axes[0].axis("off")
+
+            axes[1].imshow(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
+            axes[1].set_title("STEP 2: Water vs Vegetation Detection", fontsize=14)
+            axes[1].axis("off")
+
+            # Add legend
+            from matplotlib.patches import Patch
+
+            legend_elements = [
+                Patch(facecolor="blue", label="Water"),
+                Patch(facecolor="green", label="Vegetation"),
+            ]
+            axes[1].legend(handles=legend_elements, loc="upper right")
+
+            plt.tight_layout()
+            plt.savefig(out_dir / "step2_example.png", dpi=150, bbox_inches="tight")
+            plt.close()
+
+            example_saved = True
+
+    df = pd.DataFrame(rows).sort_values(["height", "file"]).reset_index(drop=True)
+    df.to_csv(out_dir / "summary.csv", index=False)
+
+    print(f"STEP 2 completed: {len(df)} images analyzed")
+    return df
+
+
+def analyze_step3(paths, out_subdir="step_3_h30"):
+    """
+    STEP 3: h=30m - Classify TREE vs FIELD with ResNet50
+    Anomaly detection only on FIELD
+    Output: patch-style example image
+    """
+    out_dir = OUT_DIR / out_subdir
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    example_saved = False
+
+    for p in paths:
+        h = parse_height(p)
+        if h != 30:
+            continue
+
+        img = cv2.imread(str(p))
+        if img is None:
+            continue
+
+        # Create patch overlay
+        overlay = make_patch_overlay(img, PATCH_SIZE)
+
+        # Compute statistics
+        row = {
+            "file": p.name,
+            "height": h,
+        }
+        rows.append(row)
+
+        # Save ONE patch-style example image
+        if not example_saved:
+            fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+            axes[0].imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            axes[0].set_title("Original (h=30m)", fontsize=14)
+            axes[0].axis("off")
+
+            axes[1].imshow(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
+            axes[1].set_title(
+                "STEP 3: AI Field Analysis (Tree/Field Classification)", fontsize=14
+            )
+            axes[1].axis("off")
+
+            # Add legend
+            from matplotlib.patches import Patch
+
+            legend_elements = [
+                Patch(facecolor="green", label="Field (Vegetation)"),
+                Patch(facecolor="orange", label="Tree"),
+                Patch(facecolor="blue", label="Water"),
+                Patch(facecolor="yellow", label="Soil"),
+                Patch(facecolor="red", label="Anomaly (on Field)"),
+            ]
+            axes[1].legend(handles=legend_elements, loc="upper right", fontsize=9)
+
+            plt.tight_layout()
+            plt.savefig(out_dir / "step3_example.png", dpi=150, bbox_inches="tight")
+            plt.close()
+
+            example_saved = True
+
+    df = pd.DataFrame(rows)
+    df.to_csv(out_dir / "summary.csv", index=False)
+
+    print(f"STEP 3 completed: {len(df)} images analyzed")
+    return df
+
+
+# =========================
+# MAIN
+# =========================
+def main():
+    paths = list_images(BASE_DIR)
+    print(f"Total images found: {len(paths)}\n")
+
+    print("=" * 60)
+    print("STEP 1: High altitude (80-50m) - Water vs Field Detection")
+    print("=" * 60)
+    df_1 = analyze_step1(paths)
+
+    print("\n" + "=" * 60)
+    print("STEP 2: Mid altitude (60-35m) - Water vs Vegetation Detection")
+    print("=" * 60)
+    df_2 = analyze_step2(paths)
+
+    print("\n" + "=" * 60)
+    print("STEP 3: Low altitude (30m) - Tree/Field Classification + Anomaly Detection")
+    print("=" * 60)
+    df_3 = analyze_step3(paths)
+
+    print("\n" + "=" * 60)
+    print("ANALYSIS COMPLETED!")
+    print("=" * 60)
+    print(f"Outputs saved in: {OUT_DIR}")
+    print(f"   - STEP 1: {OUT_DIR / 'step_1_h80_to_h50'}")
+    print(f"   - STEP 2: {OUT_DIR / 'step_2_h60_to_h35'}")
+    print(f"   - STEP 3: {OUT_DIR / 'step_3_h30'}")
+
+
+if __name__ == "__main__":
+    main()
